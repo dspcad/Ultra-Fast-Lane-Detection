@@ -70,7 +70,8 @@ def save_model(net, optimizer, epoch,save_path, distributed):
         # state = {'model': model_state_dict}
         assert os.path.exists(save_path)
         model_path = os.path.join(save_path, 'ep%03d.pth' % epoch)
-        torch.save(state, model_path)
+        #torch.save(state, model_path)
+        torch.save(net, model_path)
 
 import pathspec
 

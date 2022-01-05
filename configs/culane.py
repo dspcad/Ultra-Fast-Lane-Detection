@@ -1,10 +1,10 @@
 # DATA
 dataset='CULane'
-data_root = None
+data_root = '/NFS/share/Euclid/Dataset/LaneDetection/CULane/'
 
 # TRAIN
 epoch = 50
-batch_size = 32
+batch_size = 16
 optimizer = 'SGD'  #['SGD','Adam']
 learning_rate = 0.1
 weight_decay = 1e-4
@@ -19,7 +19,7 @@ warmup_iters = 695
 # NETWORK
 use_aux = True
 griding_num = 200
-backbone = '18'
+backbone = '50'
 
 # LOSS
 sim_loss_w = 0.0
@@ -28,7 +28,7 @@ shp_loss_w = 0.0
 # EXP
 note = ''
 
-log_path = None
+log_path = '/home/us000147/project/two_heads_bdd100k/Ultra-Fast-Lane-Detection/logs/'
 
 # FINETUNE or RESUME MODEL PATH
 finetune = None

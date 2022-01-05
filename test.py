@@ -26,18 +26,24 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
 
-    net = parsingNet(pretrained = False, backbone=cfg.backbone,cls_dim = (cfg.griding_num+1,cls_num_per_lane, cfg.num_lanes),
-                    use_aux=False).cuda() # we dont need auxiliary segmentation in testing
+    net = torch.load(cfg.test_model)
+    #net = parsingNet(pretrained = False, backbone=cfg.backbone,cls_dim = (cfg.griding_num+1,cls_num_per_lane, cfg.num_lanes),
+    #                use_aux=False).cuda() # we dont need auxiliary segmentation in testing
 
-    state_dict = torch.load(cfg.test_model, map_location = 'cpu')['model']
-    compatible_state_dict = {}
-    for k, v in state_dict.items():
-        if 'module.' in k:
-            compatible_state_dict[k[7:]] = v
-        else:
-            compatible_state_dict[k] = v
+    #state_dict = torch.load(cfg.test_model, map_location = 'cpu')['model']
+    #compatible_state_dict = {}
+    #for k, v in state_dict.items():
+    #    #print(f"debug: k: {k} --> {k[7:]}")
+    #    #if 'module.' in k:
+    #    #    compatible_state_dict[k[7:]] = v
+    #    if 'model.' in k:
+    #        print(f"debug: k: {k} --> {k[6:]}")
+    #        compatible_state_dict[k[6:]] = v
+    #    else:
+    #        #print(f"debug: k: {k}")
+    #        compatible_state_dict[k] = v
 
-    net.load_state_dict(compatible_state_dict, strict = False)
+    #net.load_state_dict(compatible_state_dict, strict = False)
 
     if distributed:
         net = torch.nn.parallel.DistributedDataParallel(net, device_ids = [args.local_rank])
@@ -45,4 +51,5 @@ if __name__ == "__main__":
     if not os.path.exists(cfg.test_work_dir):
         os.mkdir(cfg.test_work_dir)
 
-    eval_lane(net, cfg.dataset, cfg.data_root, cfg.test_work_dir, cfg.griding_num, False, distributed)
+    #eval_lane(net, cfg.dataset, cfg.data_root, cfg.test_work_dir, cfg.griding_num, False, distributed)
+    eval_lane(net, cfg.dataset, cfg.data_root, cfg.test_work_dir, cfg.griding_num, True, distributed)
