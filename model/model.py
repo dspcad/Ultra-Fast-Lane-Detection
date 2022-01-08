@@ -38,9 +38,9 @@ class parsingNet(torch.nn.Module):
         model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=False)
         in_features = model.roi_heads.box_predictor.cls_score.in_features
         model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 16)
-        #self.model = model.backbone.body
         resnet = model.backbone.body
 
+        self.faster_rcnn = model
 
         ###############################################################
         #    FasterRCNN ResNet backbone uses FrozenBatchNorm layers   #

@@ -4,6 +4,91 @@ from utils.common import merge_config
 from utils.dist_utils import dist_print
 from evaluation.eval_wrapper import eval_lane
 import torch
+
+
+import transforms as transforms
+from coco_utils import CocoDetection
+from coco_utils import ConvertCocoPolysToMask
+from coco_utils import resize, resizeVal
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader
+import util, math
+from coco_utils import get_coco_api_from_dataset
+from coco_eval import CocoEvaluator
+import time
+
+
+
+def evaluate(model, data_loader, device):
+    n_threads = torch.get_num_threads()
+    # FIXME remove this and make paste_masks_in_image run on the GPU
+    torch.set_num_threads(1)
+    cpu_device = torch.device("cpu")
+    model.eval()
+    metric_logger = util.MetricLogger(delimiter="  ")
+    header = 'Test:'
+
+    coco = get_coco_api_from_dataset(data_loader.dataset)
+    #iou_types = _get_iou_types(model)
+    iou_types = ["bbox"]
+
+    evaluator_15c = []
+    coco_evaluator = CocoEvaluator(coco, iou_types)
+    coco_evaluator.coco_eval["bbox"].params.catIds = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+    evaluator_15c.append(coco_evaluator)
+
+    for i in range(1,16):
+        coco_evaluator = CocoEvaluator(coco, iou_types)
+        coco_evaluator.coco_eval["bbox"].params.catIds = [i]
+        evaluator_15c.append(coco_evaluator)
+
+
+    for image, targets in metric_logger.log_every(data_loader, 100, header):
+        image = list(img.to(device) for img in image)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        torch.cuda.synchronize()
+        model_time = time.time()
+        outputs = model(image)
+
+        outputs = [{k: v.to(cpu_device) for k, v in t.items()} for t in outputs]
+        model_time = time.time() - model_time
+
+        res = {target["image_id"].item(): output for target, output in zip(targets, outputs)}
+        evaluator_time = time.time()
+
+        for coco_evaluator in evaluator_15c:
+            coco_evaluator.update(res)
+
+        evaluator_time = time.time() - evaluator_time
+        metric_logger.update(model_time=model_time, evaluator_time=evaluator_time)
+
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print(f"Averaged stats {i}:", metric_logger)
+    for coco_evaluator in evaluator_15c:
+        coco_evaluator.synchronize_between_processes()
+
+    # accumulate predictions from all images
+    #cat_id2name = {1: 'pedestrian', 2: 'rider', 3: 'car', 4: 'truck', 5 : 'bus', 6 : 'motorcycle', 7 : 'bicycle', 8 : 'traffic light', 9 : 'traffic sign', 10 : 'green', 11 : 'yellow', 12 : 'red', 13 : 'do not enter', 14 : 'stop sign', 15 : 'speed limit'}
+    #for catId in coco_evaluator.coco_gt.getCatIds():
+    #    print(f"catId: {catId}")
+    #    print(f"catId: {cat_id2name[catId]} ({catId})")
+    #    cocoEval = copy.deepcopy(coco_evaluator)
+    #    cocoEval.coco_eval["bbox"].params.catIds = [catId]
+    #    cocoEval.evaluate()
+    #    cocoEval.accumulate()
+    #    cocoEval.summarize()
+    cat_id2name = {0: '15 Classes', 1: 'pedestrian', 2: 'rider', 3: 'car', 4: 'truck', 5 : 'bus', 6 : 'motorcycle', 7 : 'bicycle', 8 : 'traffic light', 9 : 'traffic sign', 10 : 'green', 11 : 'yellow', 12 : 'red', 13 : 'do not enter', 14 : 'stop sign', 15 : 'speed limit'}
+    for i, coco_evaluator in enumerate(evaluator_15c):
+        print(f"Category: {cat_id2name[i]}")
+        coco_evaluator.accumulate()
+        coco_evaluator.summarize()
+        torch.set_num_threads(n_threads)
+    return evaluator_15c
+
+
 if __name__ == "__main__":
     torch.backends.cudnn.benchmark = True
 
@@ -51,5 +136,39 @@ if __name__ == "__main__":
     if not os.path.exists(cfg.test_work_dir):
         os.mkdir(cfg.test_work_dir)
 
-    #eval_lane(net, cfg.dataset, cfg.data_root, cfg.test_work_dir, cfg.griding_num, False, distributed)
-    eval_lane(net, cfg.dataset, cfg.data_root, cfg.test_work_dir, cfg.griding_num, True, distributed)
+    ######################################
+    #          Object Detection          #
+    ######################################
+    val_data_path   = "/NFS/share/Euclid/Dataset/ObjectDetection/BDD100K/bdd100k/images/100k/val/"
+
+    transform_val   = transforms.Compose([ConvertCocoPolysToMask(),
+                                          transforms.ToTensor(),
+                                          resizeVal(480,640)])
+
+    bdd100k_val      = CocoDetection(val_data_path, "./det_val_coco_gyr_dss.json", transforms=transform_val)
+    val_dataloader   = DataLoader(bdd100k_val, batch_size=8, shuffle=False, num_workers=8, collate_fn=util.collate_fn)
+
+    
+    model = net.faster_rcnn
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    model = model.to(device)
+    model.eval()
+    with torch.no_grad():
+        img, _ = bdd100k_val[0]
+        evaluate(model, val_dataloader, device=device)
+        prediction = model([img.to(device)])
+
+
+        print(prediction[0]['boxes'])
+        img1 = Image.fromarray(img.mul(255).permute(1, 2, 0).byte().numpy())
+        img1.save("target.png")
+
+        img1 = torchvision.transforms.ToTensor()(img1)
+        img1 = torchvision.transforms.ConvertImageDtype(dtype=torch.uint8) (img1)
+        colors=["yellow" for i in prediction[0]['boxes']]
+        img1 = torchvision.utils.draw_bounding_boxes(img1, prediction[0]['boxes'], colors=colors ,width=3,fill=True)
+        target = Image.fromarray(img1.permute(1,2,0).byte().numpy())
+        target.save("target1.png")
+
+
+    eval_lane(net, cfg.dataset, cfg.data_root, cfg.test_work_dir, cfg.griding_num, False, distributed)
