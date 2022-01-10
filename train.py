@@ -2,7 +2,7 @@ import torch, os, datetime
 import numpy as np
 
 from model.model import parsingNet
-from data.dataloader import get_train_loader, get_object_detection_train_loader
+from data.dataloader import get_train_loader
 
 from utils.dist_utils import dist_print, dist_tqdm, is_main_process, DistSummaryWriter
 from utils.factory import get_metric_dict, get_loss_dict, get_optimizer, get_scheduler
@@ -72,7 +72,9 @@ def train_with_two(net, lane_detection_data_loader, lane_loss_dict, lane_optimiz
     obj_det_itr  = iter(obj_progress_bar)
 
     b_idx = 0
-    while True:
+    obj_data_available = True
+    lane_data_available = True 
+    while obj_data_available:
         try:
             data_label = next(lane_det_itr)
             t_data_1 = time.time()
@@ -117,9 +119,13 @@ def train_with_two(net, lane_detection_data_loader, lane_loss_dict, lane_optimiz
         ########################################
         try:
             images, targets = next(obj_det_itr)
+            t_data_1 = time.time()
+
+
             images = list(image.to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
+            t_net_0 = time.time()
             loss_dict = net.faster_rcnn(images, targets)
             losses = sum(loss for loss in loss_dict.values())
 
@@ -139,16 +145,29 @@ def train_with_two(net, lane_detection_data_loader, lane_loss_dict, lane_optimiz
             obj_optimizer.step()
 
             obj_scheduler.step()
+            t_net_1 = time.time()
 
-            print(f"[Faster RCNN] Loss {loss_value}")
+            if hasattr(obj_progress_bar,'set_postfix'):
+                #kwargs = {me_name: '%.3f' % me_op.get() for me_name, me_op in zip(lane_metric_dict['name'], lane_metric_dict['op'])}
+                obj_progress_bar.set_postfix(loss = '%.3f' % float(loss_value),
+                                        data_time = '%.3f' % float(t_data_1 - t_data_0),
+                                        net_time = '%.3f' % float(t_net_1 - t_net_0),
+                                        **kwargs)
+
+            t_data_0 = time.time()
+            # print(f"[Faster RCNN] Loss {loss_value}")
             
         except StopIteration:
-            lane_data_available = False  # 
+            obj_data_available = False  # 
             print('all lane obj detect samples iterated')
-            del land_det_itr
+            del obj_det_itr
             break
 
         b_idx +=1
+
+        #print(f"current idx: {b_idx}")
+        #if b_idx == 10:
+        #    break
 
 
 def train(net, lane_detection_data_loader, loss_dict, optimizer, scheduler,logger, epoch, metric_dict, use_aux):
