@@ -1,6 +1,6 @@
 # DATA
 dataset='CULane'
-data_root = '/NFS/share/Euclid/Dataset/LaneDetection/CULane/'
+data_root = '/nfs/home/data/Euclid/Dataset/LaneDetection/CULane/'
 
 # TRAIN
 epoch = 50

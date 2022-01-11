@@ -22,6 +22,55 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 import util, math
 
+import torchvision, copy
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+
+def get_instance_of_faster_rcnn(num_classes):
+    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=False)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 16)
+    resnet = model.backbone.body
+
+
+    ###############################################################
+    #    FasterRCNN ResNet backbone uses FrozenBatchNorm layers   #
+    #                                                             #
+    #    Replace them with nn.BatchNorm2d layers.                 #
+    ###############################################################
+    bn_to_replace = []
+    for name, module in resnet.named_modules():
+        if isinstance(module, torchvision.ops.misc.FrozenBatchNorm2d):
+            print('adding ', name)
+            bn_to_replace.append(name)
+
+    # Iterate all layers to change
+    for layer_name in bn_to_replace:
+        # Check if name is nested
+        *parent, child = layer_name.split('.')
+        # Nested
+        if len(parent) > 0:
+            # Get parent modules
+            m = resnet.__getattr__(parent[0])
+            for p in parent[1:]:
+                m = m.__getattr__(p)
+            # Get the FrozenBN layer
+            orig_layer = m.__getattr__(child)
+        else:
+            m = resnet.__getattr__(child)
+            orig_layer = copy.deepcopy(m) # deepcopy, otherwise you'll get an infinite recusrsion
+        # Add your layer here
+        in_channels = orig_layer.weight.shape[0]
+        bn = torch.nn.BatchNorm2d(in_channels)
+        with torch.no_grad():
+            bn.weight = torch.nn.Parameter(orig_layer.weight)
+            bn.bias = torch.nn.Parameter(orig_layer.bias)
+            bn.running_mean = orig_layer.running_mean
+            bn.running_var = orig_layer.running_var
+        m.__setattr__(child, bn)
+
+    return model
+
+
 def inference(net, data_label, use_aux):
     if use_aux:
         img, cls_label, seg_label = data_label
@@ -60,7 +109,7 @@ def calc_loss(loss_dict, results, logger, global_step):
     return loss
 
 
-def train_with_two(net, lane_detection_data_loader, lane_loss_dict, lane_optimizer, lane_scheduler, logger, epoch, lane_metric_dict, use_aux, 
+def train_with_two(net, obj_det_net, lane_detection_data_loader, lane_loss_dict, lane_optimizer, lane_scheduler, logger, epoch, lane_metric_dict, use_aux, 
                         obj_detection_data_loader, obj_optimizer, obj_scheduler):
     net.train()
     lane_progress_bar = dist_tqdm(lane_detection_data_loader,)
@@ -126,7 +175,7 @@ def train_with_two(net, lane_detection_data_loader, lane_loss_dict, lane_optimiz
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
             t_net_0 = time.time()
-            loss_dict = net.faster_rcnn(images, targets)
+            loss_dict = obj_det_net(images, targets)
             losses = sum(loss for loss in loss_dict.values())
 
             # reduce losses over all GPUs for logging purposes
@@ -292,7 +341,9 @@ if __name__ == "__main__":
 
     lane_detection_train_loader, cls_num_per_lane = get_train_loader(cfg.batch_size, cfg.data_root, cfg.griding_num, cfg.dataset, cfg.use_aux, distributed, cfg.num_lanes)
 
-    net = parsingNet(pretrained = True, backbone=cfg.backbone,cls_dim = (cfg.griding_num+1,cls_num_per_lane, cfg.num_lanes),use_aux=cfg.use_aux).cuda()
+    num_classes = 16
+    obj_det_net = get_instance_of_faster_rcnn(num_classes).cuda()
+    net = parsingNet(pretrained = True, backbone=obj_det_net.backbone.body,cls_dim = (cfg.griding_num+1,cls_num_per_lane, cfg.num_lanes),use_aux=cfg.use_aux).cuda()
 
     if distributed:
         net = torch.nn.parallel.DistributedDataParallel(net, device_ids = [args.local_rank])
@@ -329,7 +380,7 @@ if __name__ == "__main__":
     ###########################################################
     #                 Object Dectection                       #
     ###########################################################
-    object_detection_train_data_path = "/NFS/share/Euclid/Dataset/ObjectDetection/BDD100K/bdd100k/images/100k/train/"
+    object_detection_train_data_path = "/nfs/home/data/Euclid/Dataset/ObjectDetection/BDD100K/bdd100k/images/100k/train/"
 
     transform_train = transforms.Compose([ConvertCocoPolysToMask(),
                                           transforms.ToTensor(),
@@ -340,8 +391,7 @@ if __name__ == "__main__":
 
 
     # our dataset has background and the other 15 classes of the target objects (1+15)
-    num_classes = 16
-    batch_size  = 4
+    batch_size  = 16
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     learning_rate = 0.001
 
@@ -356,7 +406,7 @@ if __name__ == "__main__":
     # bdd100k_train_sampler             =  DistributedSampler(dataset=bdd100k_train)
     object_detection_train_dataloader = DataLoader(bdd100k_train, batch_size=batch_size, shuffle=False, sampler=bdd100k_train_sampler, num_workers=0, collate_fn=util.collate_fn)
     # construct an optimizer
-    params = [p for p in net.faster_rcnn.parameters() if p.requires_grad]
+    params = [p for p in obj_det_net.parameters() if p.requires_grad]
     object_detection_optimizer = torch.optim.SGD(params, lr=learning_rate, momentum=0.9, weight_decay=0.0005)
 
     # and a learning rate scheduler
@@ -366,7 +416,7 @@ if __name__ == "__main__":
 
     for epoch in range(resume_epoch, cfg.epoch):
 
-        train_with_two(net, lane_detection_train_loader, loss_dict, optimizer, scheduler,logger, epoch, metric_dict, cfg.use_aux, object_detection_train_dataloader, object_detection_optimizer, lr_scheduler)
+        train_with_two(net, obj_det_net, lane_detection_train_loader, loss_dict, optimizer, scheduler,logger, epoch, metric_dict, cfg.use_aux, object_detection_train_dataloader, object_detection_optimizer, lr_scheduler)
         #train(net, lane_detection_train_loader, loss_dict, optimizer, scheduler,logger, epoch, metric_dict, cfg.use_aux)
         #train_one_epoch(net.faster_rcnn, object_detection_optimizer, object_detection_train_dataloader, device, epoch, print_freq=10)
         # update the learning rate
