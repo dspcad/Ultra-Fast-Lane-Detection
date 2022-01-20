@@ -17,13 +17,17 @@ import time
 import transforms as transforms
 from coco_utils import CocoDetection
 from coco_utils import ConvertCocoPolysToMask
-from coco_utils import resize, resizeVal
+from coco_utils import resize, resizeVal, normalize
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 import util, math
 
 import torchvision, copy
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+
+
+
+obj_det_ave_loss = 0.0
 
 def get_instance_of_faster_rcnn(num_classes):
     model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=False)
@@ -111,7 +115,12 @@ def calc_loss(loss_dict, results, logger, global_step):
 
 def train_with_two(net, obj_det_net, lane_detection_data_loader, lane_loss_dict, lane_optimizer, lane_scheduler, logger, epoch, lane_metric_dict, use_aux, 
                         obj_detection_data_loader, obj_optimizer, obj_scheduler):
+    global obj_det_ave_loss
     net.train()
+
+    cnt_lane = len(lane_detection_data_loader)
+    cnt_obj  = len(obj_detection_data_loader)
+
     lane_progress_bar = dist_tqdm(lane_detection_data_loader,)
     obj_progress_bar  = dist_tqdm(obj_detection_data_loader,)
     t_data_0 = time.time()
@@ -120,46 +129,57 @@ def train_with_two(net, obj_det_net, lane_detection_data_loader, lane_loss_dict,
     lane_det_itr = iter(lane_progress_bar)
     obj_det_itr  = iter(obj_progress_bar)
 
-    b_idx = 0
+    b_lane_idx = 0
+    b_obj_idx  = 0
     obj_data_available = True
     lane_data_available = True 
     while obj_data_available:
+        ########################################
+        #          Lane Detection              #
+        ########################################
         try:
-            data_label = next(lane_det_itr)
-            t_data_1 = time.time()
-            reset_metrics(lane_metric_dict)
-            global_step = epoch * len(lane_detection_data_loader,) + b_idx
+            run_times = 2 if cnt_lane>cnt_obj else 1
+
+
+            for i in range(run_times):
+                data_label = next(lane_det_itr)
+                t_data_1 = time.time()
+                reset_metrics(lane_metric_dict)
+                global_step = epoch * len(lane_detection_data_loader) + b_lane_idx
     
-            t_net_0 = time.time()
-            results = inference(net, data_label, use_aux)
+                t_net_0 = time.time()
+                results = inference(net, data_label, use_aux)
     
-            loss = calc_loss(lane_loss_dict, results, logger, global_step)
-            lane_optimizer.zero_grad()
-            loss.backward()
-            lane_optimizer.step()
-            lane_scheduler.step(global_step)
-            t_net_1 = time.time()
+                loss = calc_loss(lane_loss_dict, results, logger, global_step)
+                lane_optimizer.zero_grad()
+                loss.backward()
+                lane_optimizer.step()
+                lane_scheduler.step(global_step)
+                t_net_1 = time.time()
     
-            results = resolve_val_data(results, use_aux)
+                results = resolve_val_data(results, use_aux)
     
-            update_metrics(lane_metric_dict, results)
-            if global_step % 20 == 0:
-                for me_name, me_op in zip(lane_metric_dict['name'], lane_metric_dict['op']):
-                    logger.add_scalar('metric/' + me_name, me_op.get(), global_step=global_step)
-            logger.add_scalar('meta/lr', optimizer.param_groups[0]['lr'], global_step=global_step)
+                update_metrics(lane_metric_dict, results)
+                if global_step % 20 == 0:
+                    for me_name, me_op in zip(lane_metric_dict['name'], lane_metric_dict['op']):
+                        logger.add_scalar('metric/' + me_name, me_op.get(), global_step=global_step)
+                logger.add_scalar('meta/lr', optimizer.param_groups[0]['lr'], global_step=global_step)
     
-            if hasattr(lane_progress_bar,'set_postfix'):
-                kwargs = {me_name: '%.3f' % me_op.get() for me_name, me_op in zip(lane_metric_dict['name'], lane_metric_dict['op'])}
-                lane_progress_bar.set_postfix(loss = '%.3f' % float(loss),
-                                        data_time = '%.3f' % float(t_data_1 - t_data_0),
-                                        net_time = '%.3f' % float(t_net_1 - t_net_0),
-                                        **kwargs)
-            t_data_0 = time.time()
+                if hasattr(lane_progress_bar,'set_postfix'):
+                    kwargs = {me_name: '%.3f' % me_op.get() for me_name, me_op in zip(lane_metric_dict['name'], lane_metric_dict['op'])}
+                    lane_progress_bar.set_postfix(loss = '%.3f' % float(loss),
+                                            data_time = '%.3f' % float(t_data_1 - t_data_0),
+                                            net_time = '%.3f' % float(t_net_1 - t_net_0),
+                                            **kwargs)
+                t_data_0 = time.time()
+                b_lane_idx += 1
+
+            cnt_lane -= run_times
 
         except StopIteration:
             lane_data_available = False  # 
             print('all lane obj detect samples iterated')
-            del land_det_itr
+            del lane_det_itr
             break
 
 
@@ -167,9 +187,13 @@ def train_with_two(net, obj_det_net, lane_detection_data_loader, lane_loss_dict,
         #        Object Detection              #
         ########################################
         try:
+            #run_times = min(10,cnt_obj) if cnt_obj>cnt_lane else 1
+
+            #for i in range(run_times):
             images, targets = next(obj_det_itr)
             t_data_1 = time.time()
 
+            global_step = epoch * len(obj_detection_data_loader) + b_obj_idx
 
             images = list(image.to(device) for image in images)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -177,6 +201,8 @@ def train_with_two(net, obj_det_net, lane_detection_data_loader, lane_loss_dict,
             t_net_0 = time.time()
             loss_dict = obj_det_net(images, targets)
             losses = sum(loss for loss in loss_dict.values())
+
+            obj_det_ave_loss = (obj_det_ave_loss*global_step + float(losses) )/(global_step+1)
 
             # reduce losses over all GPUs for logging purposes
             loss_dict_reduced = util.reduce_dict(loss_dict)
@@ -197,13 +223,17 @@ def train_with_two(net, obj_det_net, lane_detection_data_loader, lane_loss_dict,
             t_net_1 = time.time()
 
             if hasattr(obj_progress_bar,'set_postfix'):
-                #kwargs = {me_name: '%.3f' % me_op.get() for me_name, me_op in zip(lane_metric_dict['name'], lane_metric_dict['op'])}
-                obj_progress_bar.set_postfix(loss = '%.3f' % float(loss_value),
+                # kwargs = {me_name: '%.3f' % me_op.get() for me_name, me_op in zip(lane_metric_dict['name'], lane_metric_dict['op'])}
+                obj_progress_bar.set_postfix(loss = '%.3f' % obj_det_ave_loss, cur_loss= '%.3f' % float(losses),
                                         data_time = '%.3f' % float(t_data_1 - t_data_0),
-                                        net_time = '%.3f' % float(t_net_1 - t_net_0),
-                                        **kwargs)
+                                        net_time = '%.3f' % float(t_net_1 - t_net_0))
+                                        #**kwargs)
 
             t_data_0 = time.time()
+            b_obj_idx += 1
+
+            #cnt_obj -=run_times
+            cnt_obj -=1
             # print(f"[Faster RCNN] Loss {loss_value}")
             
         except StopIteration:
@@ -212,7 +242,7 @@ def train_with_two(net, obj_det_net, lane_detection_data_loader, lane_loss_dict,
             del obj_det_itr
             break
 
-        b_idx +=1
+
 
         #print(f"current idx: {b_idx}")
         #if b_idx == 10:
@@ -340,13 +370,13 @@ if __name__ == "__main__":
 
 
     lane_detection_train_loader, cls_num_per_lane = get_train_loader(cfg.batch_size, cfg.data_root, cfg.griding_num, cfg.dataset, cfg.use_aux, distributed, cfg.num_lanes)
-
-    num_classes = 16
-    obj_det_net = get_instance_of_faster_rcnn(num_classes).cuda()
-    net = parsingNet(pretrained = True, backbone=obj_det_net.backbone.body,cls_dim = (cfg.griding_num+1,cls_num_per_lane, cfg.num_lanes),use_aux=cfg.use_aux).cuda()
+    net = parsingNet(pretrained = True, backbone='50',cls_dim = (cfg.griding_num+1,cls_num_per_lane, cfg.num_lanes),use_aux=cfg.use_aux).cuda()
+    obj_det_net = net.faster_rcnn
 
     if distributed:
-        net = torch.nn.parallel.DistributedDataParallel(net, device_ids = [args.local_rank])
+        net         = torch.nn.parallel.DistributedDataParallel(net, device_ids = [args.local_rank], find_unused_parameters=True)
+        #net._set_static_graph()
+
     optimizer = get_optimizer(net, cfg)
 
     if cfg.finetune is not None:
@@ -384,14 +414,15 @@ if __name__ == "__main__":
 
     transform_train = transforms.Compose([ConvertCocoPolysToMask(),
                                           transforms.ToTensor(),
-                                          transforms.RandomHorizontalFlip(0.5),
-                                          resize(480,640)])
-                                          #torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+                                          normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                                          #transforms.RandomHorizontalFlip(0.5),
                                           #resize(480,640)])
+                                          resize(480,640)])
 
 
     # our dataset has background and the other 15 classes of the target objects (1+15)
-    batch_size  = 16
+    batch_size  = 8
+    num_classes = 16
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     learning_rate = 0.001
 
@@ -399,18 +430,19 @@ if __name__ == "__main__":
     bdd100k_train                     = CocoDetection(object_detection_train_data_path, "./det_train_coco_gyr_dss.json", transforms=transform_train)
 
     if distributed:
-        bdd100k_train_sampler = torch.utils.data.distributed.DistributedSampler(dataset=bdd100k_train)
+        bdd100k_train_sampler = torch.utils.data.distributed.DistributedSampler(dataset=bdd100k_train,shuffle=True,seed=42)
     else:
         bdd100k_train_sampler = torch.utils.data.RandomSampler(bdd100k_train)
 
     # bdd100k_train_sampler             =  DistributedSampler(dataset=bdd100k_train)
-    object_detection_train_dataloader = DataLoader(bdd100k_train, batch_size=batch_size, shuffle=False, sampler=bdd100k_train_sampler, num_workers=0, collate_fn=util.collate_fn)
+    object_detection_train_dataloader = DataLoader(bdd100k_train, batch_size=batch_size, shuffle=False, sampler=bdd100k_train_sampler, num_workers=8, collate_fn=util.collate_fn)
     # construct an optimizer
     params = [p for p in obj_det_net.parameters() if p.requires_grad]
-    object_detection_optimizer = torch.optim.SGD(params, lr=learning_rate, momentum=0.9, weight_decay=0.0005)
+    object_detection_optimizer = torch.optim.SGD(params, lr=learning_rate, momentum=0.9, weight_decay=0.0001)
 
     # and a learning rate scheduler
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(object_detection_optimizer, T_max=100)
+    # lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(object_detection_optimizer, milestones=[25,38], gamma=0.1)
 
 
 

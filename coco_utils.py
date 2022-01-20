@@ -271,6 +271,16 @@ class resizeVal(object):
         #print(f"img shape: {img.shape}")
         return img, target
 
+class normalize(object):
+    def __init__(self, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
+        self.mean = mean
+        self.std  = std
+
+    def __call__(self, image, target):
+        image = T.functional.normalize(image, mean=self.mean, std=self.std)
+        return image, target
+
+
 
 class CocoDetection(torchvision.datasets.CocoDetection):
     def __init__(self, img_folder, ann_file, transforms):

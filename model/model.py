@@ -20,7 +20,7 @@ class conv_bn_relu(torch.nn.Module):
         x = self.relu(x)
         return x
 class parsingNet(torch.nn.Module):
-    def __init__(self, size=(288, 800), pretrained=True, backbone=None, cls_dim=(37, 10, 4), use_aux=False):
+    def __init__(self, size=(288, 800), pretrained=True, backbone='50', cls_dim=(37, 10, 4), use_aux=False):
         super(parsingNet, self).__init__()
 
         self.size = size
@@ -36,13 +36,55 @@ class parsingNet(torch.nn.Module):
         # self.model = resnet(backbone, pretrained=pretrained)
 
 
+        model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=False)
+        in_features = model.roi_heads.box_predictor.cls_score.in_features
+        model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 16)
+        resnet = model.backbone.body
+
+        self.faster_rcnn = model
 
 
-        print(backbone)
-        print(f"backbone: {backbone}")
+        ###############################################################
+        #    FasterRCNN ResNet backbone uses FrozenBatchNorm layers   #
+        #                                                             #
+        #    Replace them with nn.BatchNorm2d layers.                 #
+        ###############################################################
+        bn_to_replace = []
+        for name, module in resnet.named_modules():
+            if isinstance(module, torchvision.ops.misc.FrozenBatchNorm2d):
+                print('adding ', name)
+                bn_to_replace.append(name)
 
-        self.model = backbone
+        # Iterate all layers to change
+        for layer_name in bn_to_replace:
+            # Check if name is nested
+            *parent, child = layer_name.split('.')
+            # Nested
+            if len(parent) > 0:
+                # Get parent modules
+                m = resnet.__getattr__(parent[0])
+                for p in parent[1:]:
+                    m = m.__getattr__(p)
+                # Get the FrozenBN layer
+                orig_layer = m.__getattr__(child)
+            else:
+                m = resnet.__getattr__(child)
+                orig_layer = copy.deepcopy(m) # deepcopy, otherwise you'll get an infinite recusrsion
+            # Add your layer here
+            in_channels = orig_layer.weight.shape[0]
+            bn = torch.nn.BatchNorm2d(in_channels)
+            with torch.no_grad():
+                bn.weight = torch.nn.Parameter(orig_layer.weight)
+                bn.bias = torch.nn.Parameter(orig_layer.bias)
+                bn.running_mean = orig_layer.running_mean
+                bn.running_var = orig_layer.running_var
+            m.__setattr__(child, bn)
 
+
+        #print(resnet)
+        #print(f"backbone: {resnet}")
+
+        self.model = resnet
 
         if self.use_aux:
             self.aux_header2 = torch.nn.Sequential(

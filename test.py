@@ -9,13 +9,15 @@ import torch
 import transforms as transforms
 from coco_utils import CocoDetection
 from coco_utils import ConvertCocoPolysToMask
-from coco_utils import resize, resizeVal
+from coco_utils import resize, resizeVal, normalize
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
 import util, math
 from coco_utils import get_coco_api_from_dataset
 from coco_eval import CocoEvaluator
-import time
+import time, torchvision
+from PIL import Image
+
 
 
 
@@ -94,10 +96,10 @@ if __name__ == "__main__":
 
     args, cfg = merge_config()
 
-    distributed = False
     if 'WORLD_SIZE' in os.environ:
         distributed = int(os.environ['WORLD_SIZE']) > 1
 
+    distributed = False
     if distributed:
         torch.cuda.set_device(args.local_rank)
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
@@ -111,45 +113,48 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
 
-    net = torch.load(cfg.test_model)
-    #net = parsingNet(pretrained = False, backbone=cfg.backbone,cls_dim = (cfg.griding_num+1,cls_num_per_lane, cfg.num_lanes),
-    #                use_aux=False).cuda() # we dont need auxiliary segmentation in testing
+    #net = torch.load(cfg.test_model)
 
-    #state_dict = torch.load(cfg.test_model, map_location = 'cpu')['model']
-    #compatible_state_dict = {}
-    #for k, v in state_dict.items():
-    #    #print(f"debug: k: {k} --> {k[7:]}")
-    #    #if 'module.' in k:
-    #    #    compatible_state_dict[k[7:]] = v
-    #    if 'model.' in k:
-    #        print(f"debug: k: {k} --> {k[6:]}")
-    #        compatible_state_dict[k[6:]] = v
-    #    else:
-    #        #print(f"debug: k: {k}")
-    #        compatible_state_dict[k] = v
+    net = parsingNet(pretrained = False, backbone=cfg.backbone,cls_dim = (cfg.griding_num+1,cls_num_per_lane, cfg.num_lanes),
+                    use_aux=False).cuda() # we dont need auxiliary segmentation in testing
 
-    #net.load_state_dict(compatible_state_dict, strict = False)
+    state_dict = torch.load(cfg.test_model, map_location = 'cpu')['model']
+    compatible_state_dict = {}
+    for k, v in state_dict.items():
+        #print(f"debug: k: {k} --> {k[7:]}")
+        if 'module.' in k:
+            compatible_state_dict[k[7:]] = v
+        #if 'model.' in k:
+        #    compatible_state_dict[k[6:]] = v
+        else:
+            #print(f"debug: k: {k}")
+            compatible_state_dict[k] = v
 
+    net.load_state_dict(compatible_state_dict, strict = False)
+
+    model = net.faster_rcnn
     if distributed:
         net = torch.nn.parallel.DistributedDataParallel(net, device_ids = [args.local_rank])
 
     if not os.path.exists(cfg.test_work_dir):
         os.mkdir(cfg.test_work_dir)
 
+    #eval_lane(net, cfg.dataset, cfg.data_root, cfg.test_work_dir, cfg.griding_num, True, distributed)
+    eval_lane(net, cfg.dataset, cfg.data_root, cfg.test_work_dir, cfg.griding_num, False, distributed)
     ######################################
     #          Object Detection          #
     ######################################
-    val_data_path   = "/NFS/share/Euclid/Dataset/ObjectDetection/BDD100K/bdd100k/images/100k/val/"
+    val_data_path   = "/nfs/home/data/Euclid/Dataset/ObjectDetection/BDD100K/bdd100k/images/100k/val/"
 
     transform_val   = transforms.Compose([ConvertCocoPolysToMask(),
                                           transforms.ToTensor(),
+                                          normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                                           resizeVal(480,640)])
 
     bdd100k_val      = CocoDetection(val_data_path, "./det_val_coco_gyr_dss.json", transforms=transform_val)
-    val_dataloader   = DataLoader(bdd100k_val, batch_size=8, shuffle=False, num_workers=8, collate_fn=util.collate_fn)
+    val_dataloader   = DataLoader(bdd100k_val, batch_size=16, shuffle=False, num_workers=8, collate_fn=util.collate_fn)
 
     
-    model = net.faster_rcnn
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     model = model.to(device)
     model.eval()
@@ -171,4 +176,3 @@ if __name__ == "__main__":
         target.save("target1.png")
 
 
-    eval_lane(net, cfg.dataset, cfg.data_root, cfg.test_work_dir, cfg.griding_num, False, distributed)

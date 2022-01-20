@@ -67,11 +67,12 @@ def save_model(net, optimizer, epoch,save_path, distributed):
     if is_main_process():
         model_state_dict = net.state_dict()
         state = {'model': model_state_dict, 'optimizer': optimizer.state_dict()}
-        # state = {'model': model_state_dict}
+        state = {'model': model_state_dict}
         assert os.path.exists(save_path)
         model_path = os.path.join(save_path, 'ep%03d.pth' % epoch)
-        #torch.save(state, model_path)
-        torch.save(net, model_path)
+        full_model_path = os.path.join(save_path, 'ep%03d_full.pth' % epoch)
+        torch.save(state, model_path)
+        # torch.save(net, full_model_path)
 
 import pathspec
 
